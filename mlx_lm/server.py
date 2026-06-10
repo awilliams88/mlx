@@ -45,6 +45,14 @@ from .models.cache import (
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
+# Fallback helpers for models that emit raw JSON tool calls as text.
+from .tool_parsers.qwen25_coder import (
+    add_stream_tool_call_indexes,
+    strip_special_chat_tokens,
+    to_openai_tool_call,
+    try_parse_raw_tool_call,
+)
+
 
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
@@ -1475,8 +1483,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
 
+                # Buffer tool-capable streams so raw JSON can be parsed first.
                 if (
                     self.stream
+                    and not request.tools
                     and gen.state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
@@ -1497,18 +1507,55 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
+            if text.strip():
+                logging.debug("Generated raw text tail: %s", text.strip()[-1000:])
+
+            # Remove leaked chat-template tokens before parsing or returning text.
+            text = strip_special_chat_tokens(text)
+            reasoning_text = strip_special_chat_tokens(reasoning_text)
+
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
 
+            # Convert raw JSON assistant text into an OpenAI tool call.
+            if not made_tool_call and request.tools and text.strip():
+                parsed_tool = try_parse_raw_tool_call(text)
+                if parsed_tool is not None:
+                    logging.debug(
+                        "Converted Qwen2.5 raw JSON output to OpenAI tool_call: %s",
+                        parsed_tool["name"],
+                    )
+                    tool_calls.append(to_openai_tool_call(parsed_tool))
+                    text = ""
+                    made_tool_call = True
+
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
 
+            # Send stream content before the final stop chunk.
             if self.stream:
+                formatted_tool_calls = (
+                    add_stream_tool_call_indexes(tool_calls)
+                    if tool_calls and isinstance(tool_calls[0], dict)
+                    else tool_formatter(tool_calls)
+                )
+
+                if text and not formatted_tool_calls:
+                    resp = self.generate_response(
+                        text,
+                        None,
+                        reasoning_text=reasoning_text,
+                    )
+                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self.wfile.flush()
+                    text = ""
+                    reasoning_text = ""
+
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=formatted_tool_calls,
                     reasoning_text=reasoning_text,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -1537,7 +1584,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=(
+                        tool_calls
+                        if tool_calls and isinstance(tool_calls[0], dict)
+                        else tool_formatter(tool_calls)
+                    ),
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
